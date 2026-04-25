@@ -1,0 +1,23 @@
+# Data folders (never commit data)
+city_data/
+output/
+*.parquet
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Misc
+*.log

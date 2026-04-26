@@ -621,9 +621,12 @@ def run_poc(city: str, data_root: Path, out_root: Path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PoC: extract sigma_pos from taxi GPS")
-    parser.add_argument("--city", required=True,
-                        help="City folder name under data-root (e.g. 'beijing')")
+    parser = argparse.ArgumentParser(
+        description="PoC: extract sigma_pos from taxi GPS. "
+                    "Without --city, processes all subfolders in data-root.")
+    parser.add_argument("--city", default=None,
+                        help="(Optional) City folder name. "
+                             "If omitted, processes ALL subfolders in city_data/.")
     parser.add_argument("--data-root", default="../city_data",
                         help="Root dir containing city subdirs")
     parser.add_argument("--out-root", default="../output",
@@ -635,7 +638,40 @@ def main():
     if not data_root.exists():
         sys.exit(f"data-root {data_root} does not exist")
 
-    run_poc(args.city, data_root, out_root)
+    # Determine list of cities to run
+    if args.city is not None:
+        cities = [args.city]
+    else:
+        # Auto-discover: every subfolder of data_root that contains parquet files
+        cities = []
+        for sub in sorted(data_root.iterdir()):
+            if sub.is_dir() and any(sub.glob("*.parquet")):
+                cities.append(sub.name)
+        if not cities:
+            sys.exit(f"No city subfolders with parquet files found in {data_root}")
+        print(f"\n[BATCH MODE] Found {len(cities)} cities: {cities}\n")
+
+    failed = []
+    for i, city in enumerate(cities):
+        if len(cities) > 1:
+            print(f"\n{'#'*70}")
+            print(f"# [{i+1}/{len(cities)}] Processing city: {city}")
+            print(f"{'#'*70}")
+        try:
+            run_poc(city, data_root, out_root)
+        except Exception as e:
+            failed.append(city)
+            print(f"[BATCH] {city} failed with: {e}")
+            import traceback
+            traceback.print_exc()
+            print(f"[BATCH] Continuing with next city...")
+
+    if len(cities) > 1:
+        print(f"\n{'='*70}")
+        print(f"BATCH SUMMARY: {len(cities)-len(failed)}/{len(cities)} cities succeeded")
+        if failed:
+            print(f"  Failed: {failed}")
+        print('='*70)
 
 
 if __name__ == "__main__":

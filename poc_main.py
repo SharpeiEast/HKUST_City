@@ -24,6 +24,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
 import warnings
 from datetime import datetime
@@ -541,6 +542,14 @@ def run_poc(city: str, data_root: Path, out_root: Path):
     """Run full PoC pipeline for one city."""
     city_dir = data_root / city
     out_dir = out_root / f"poc_{city}"
+
+    # Auto-cleanup: remove old output for this city to ensure fresh results.
+    # Only this city's poc_<city> folder is removed; other cities and the
+    # diag_<city> folders are untouched.
+    if out_dir.exists():
+        print(f"[INFO] Removing existing {out_dir}")
+        shutil.rmtree(out_dir)
+
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "stats").mkdir(exist_ok=True)
     (out_dir / "figures").mkdir(exist_ok=True)

@@ -42,15 +42,27 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION (v2 - tuned based on diagnostic findings)
 # ============================================================
 
 # Stationary segment detection
 SPEED_THRESHOLD_KMH = 2.0          # speed below this = potentially stationary
-MIN_SEGMENT_DURATION_S = 300       # minimum 5 minutes of stationarity
-MAX_SEGMENT_DISPLACEMENT_M = 30    # if max displacement > 30m, not truly stationary
-MIN_POINTS_PER_SEGMENT = 10        # need at least 10 GPS points for reliable sigma estimate
+MIN_SEGMENT_DURATION_S = 180       # minimum 3 minutes (was 5min - too strict)
+MAX_SEGMENT_DISPLACEMENT_M = 50    # was 30m, slightly relaxed
+MIN_POINTS_PER_SEGMENT = 8         # was 10, relaxed for shorter sampling intervals
 MAX_TIME_GAP_WITHIN_SEGMENT_S = 120  # gaps > 2 min split a segment
+
+# v2 NEW: coordinate diversity filter (the most important addition)
+# Diagnostic showed many segments have unique_coords/n_points < 0.3, indicating
+# map-matching artifacts. We require segments to preserve coordinate variation.
+MIN_UNIQUENESS_RATIO = 0.5        # at least 50% of points must have distinct coords
+MIN_UNIQUE_COORDS = 5             # at least 5 distinct (lon, lat) pairs
+
+# v2 NEW: long-segment splitting
+# Long stops (>15min) often have map-matching kicked in part-way through.
+# Split them into chunks and evaluate each separately.
+MAX_SEGMENT_DURATION_S = 900       # 15 minutes; split longer segments
+SUBSEGMENT_DURATION_S = 600        # split into 10-minute sub-segments
 
 # Spatial aggregation grids (in meters)
 GRID_SIZES_M = [50, 100, 250]     # main analysis: 100m. 50m & 250m for sensitivity check
@@ -63,7 +75,7 @@ TIME_BIN_LABELS = ["00-04", "04-08", "08-12", "12-16", "16-20", "20-24"]
 M_PER_DEG_LAT = 111320.0           # approximate, varies <1% by latitude
 
 # Diagnostic / sanity-check thresholds
-SIGMA_POS_REASONABLE_RANGE_M = (0.1, 100.0)  # sigma_pos outside this is suspicious
+SIGMA_POS_REASONABLE_RANGE_M = (0.1, 100.0)
 
 # ============================================================
 # LOGGING
@@ -201,81 +213,150 @@ def detect_stationary_segments(df: pd.DataFrame, logger) -> pd.DataFrame:
 # SIGMA_POS COMPUTATION
 # ============================================================
 
-def compute_segment_sigma_pos(seg_df: pd.DataFrame, logger) -> pd.DataFrame:
+def compute_segment_sigma_pos(seg_df: pd.DataFrame, logger) -> tuple:
     """For each stationary segment, compute sigma_pos (positioning uncertainty).
 
-    sigma_pos is computed using median absolute deviation (MAD)-based estimator,
-    which is robust to outliers/jumps common in urban canyon GPS:
+    v2 changes:
+    - Splits long segments (>15 min) into 10-min sub-segments. Map-matching
+      tends to engage after a few minutes of stationarity, so early portions
+      of a long stop are often raw while later portions are snapped. Splitting
+      lets us use the raw early portions and reject the snapped later ones.
+    - Adds uniqueness_ratio filter: requires segment internal coordinate
+      diversity > MIN_UNIQUENESS_RATIO. This is the key filter to exclude
+      map-matched segments (where most points share the same coords).
+    - Tracks why each segment was rejected (filter funnel statistics).
 
+    sigma_pos is computed using MAD-based estimator:
         sigma_pos = sqrt(MAD_x^2 + MAD_y^2) * 1.4826
-    
-    where MAD_x is in meters (longitude scaled by cos(lat)).
     """
-    logger.info("Computing per-segment sigma_pos...")
+    logger.info("Computing per-segment sigma_pos (v2 with sub-segmenting and uniqueness filter)...")
     grouped = seg_df.groupby("segment_id")
 
+    # Filter funnel counters
+    funnel = {
+        "total_provisional": 0,
+        "subsegments_created": 0,
+        "rejected_too_few_points": 0,
+        "rejected_too_short": 0,
+        "rejected_too_displaced": 0,
+        "rejected_low_uniqueness": 0,
+        "rejected_too_few_unique_coords": 0,
+        "passed_all_filters": 0,
+    }
+
     rows = []
-    n_total = grouped.ngroups
     for sid, g in grouped:
-        n_pts = len(g)
-        duration = (g["gps_time"].max() - g["gps_time"].min()).total_seconds()
+        funnel["total_provisional"] += 1
+        # Sort by time to be safe
+        g = g.sort_values("gps_time").reset_index(drop=True)
+        full_duration = (g["gps_time"].max() - g["gps_time"].min()).total_seconds()
 
-        # Filter: minimum points and duration
-        if n_pts < MIN_POINTS_PER_SEGMENT or duration < MIN_SEGMENT_DURATION_S:
-            continue
+        # Decide if we split this segment
+        if full_duration > MAX_SEGMENT_DURATION_S:
+            # Split into sub-segments based on time
+            t0 = g["gps_time"].iloc[0]
+            g["sub_idx"] = ((g["gps_time"] - t0).dt.total_seconds() //
+                             SUBSEGMENT_DURATION_S).astype(int)
+            sub_groups = [(f"{sid}_{si}", sub) for si, sub in g.groupby("sub_idx")]
+            funnel["subsegments_created"] += len(sub_groups)
+        else:
+            sub_groups = [(str(sid), g)]
 
-        lon = g["lon"].values
-        lat = g["lat"].values
-        lat_mean = np.mean(lat)
+        # Process each (sub-)segment
+        for sub_sid, sg in sub_groups:
+            n_pts = len(sg)
+            duration = (sg["gps_time"].max() - sg["gps_time"].min()).total_seconds()
 
-        # Convert to meters relative to median location
-        lon_m_per_deg = M_PER_DEG_LAT * np.cos(np.radians(lat_mean))
-        x_m = (lon - np.median(lon)) * lon_m_per_deg
-        y_m = (lat - np.median(lat)) * M_PER_DEG_LAT
+            # Filter 1: minimum points
+            if n_pts < MIN_POINTS_PER_SEGMENT:
+                funnel["rejected_too_few_points"] += 1
+                continue
+            # Filter 2: minimum duration
+            if duration < MIN_SEGMENT_DURATION_S:
+                funnel["rejected_too_short"] += 1
+                continue
 
-        # Reject if max displacement too large (vehicle was actually moving slowly)
-        max_disp = np.sqrt(x_m**2 + y_m**2).max()
-        if max_disp > MAX_SEGMENT_DISPLACEMENT_M:
-            continue
+            lon = sg["lon"].values
+            lat = sg["lat"].values
+            lat_mean = float(np.mean(lat))
 
-        # Robust sigma estimation via MAD
-        # MAD = median(|x - median(x)|), and sigma ≈ 1.4826 * MAD for Gaussian
-        mad_x = np.median(np.abs(x_m))
-        mad_y = np.median(np.abs(y_m))
-        sigma_x = 1.4826 * mad_x
-        sigma_y = 1.4826 * mad_y
-        sigma_pos = np.sqrt(sigma_x**2 + sigma_y**2)
+            # Coordinate diversity (NEW filter)
+            n_unique_coords = len(set(zip(lon.tolist(), lat.tolist())))
+            uniqueness_ratio = n_unique_coords / n_pts
 
-        # Also compute non-robust std for comparison
-        std_pos = np.sqrt(np.var(x_m) + np.var(y_m))
+            # Filter 3: minimum unique coordinates count
+            if n_unique_coords < MIN_UNIQUE_COORDS:
+                funnel["rejected_too_few_unique_coords"] += 1
+                continue
+            # Filter 4: uniqueness ratio (most important - excludes map-matched data)
+            if uniqueness_ratio < MIN_UNIQUENESS_RATIO:
+                funnel["rejected_low_uniqueness"] += 1
+                continue
 
-        rows.append({
-            "segment_id": sid,
-            "vehicle_id": g["vehicle_id"].iloc[0],
-            "n_points": n_pts,
-            "duration_s": duration,
-            "median_lon": float(np.median(lon)),
-            "median_lat": float(np.median(lat)),
-            "max_disp_m": float(max_disp),
-            "sigma_x_m": float(sigma_x),
-            "sigma_y_m": float(sigma_y),
-            "sigma_pos_m": float(sigma_pos),
-            "sigma_pos_std_m": float(std_pos),
-            "start_time": g["gps_time"].min(),
-            "end_time": g["gps_time"].max(),
-            "hour_start": g["gps_time"].min().hour,
-        })
+            # Convert to meters relative to median location
+            lon_m_per_deg = M_PER_DEG_LAT * np.cos(np.radians(lat_mean))
+            x_m = (lon - np.median(lon)) * lon_m_per_deg
+            y_m = (lat - np.median(lat)) * M_PER_DEG_LAT
+
+            # Filter 5: max displacement (vehicle should be approximately stationary)
+            max_disp = float(np.sqrt(x_m**2 + y_m**2).max())
+            if max_disp > MAX_SEGMENT_DISPLACEMENT_M:
+                funnel["rejected_too_displaced"] += 1
+                continue
+
+            # Robust sigma estimation via MAD
+            mad_x = np.median(np.abs(x_m))
+            mad_y = np.median(np.abs(y_m))
+            sigma_x = 1.4826 * mad_x
+            sigma_y = 1.4826 * mad_y
+            sigma_pos = float(np.sqrt(sigma_x**2 + sigma_y**2))
+
+            # Non-robust std for comparison
+            std_pos = float(np.sqrt(np.var(x_m) + np.var(y_m)))
+
+            funnel["passed_all_filters"] += 1
+            rows.append({
+                "segment_id": sub_sid,
+                "vehicle_id": sg["vehicle_id"].iloc[0],
+                "n_points": int(n_pts),
+                "n_unique_coords": int(n_unique_coords),
+                "uniqueness_ratio": float(uniqueness_ratio),
+                "duration_s": float(duration),
+                "median_lon": float(np.median(lon)),
+                "median_lat": float(np.median(lat)),
+                "max_disp_m": float(max_disp),
+                "sigma_x_m": float(sigma_x),
+                "sigma_y_m": float(sigma_y),
+                "sigma_pos_m": sigma_pos,
+                "sigma_pos_std_m": std_pos,
+                "start_time": sg["gps_time"].min(),
+                "end_time": sg["gps_time"].max(),
+                "hour_start": sg["gps_time"].min().hour,
+            })
 
     seg_summary = pd.DataFrame(rows)
-    logger.info(f"  Valid segments: {len(seg_summary):,} (after duration/points/displacement filters)")
+
+    # Print filter funnel
+    logger.info(f"  Filter funnel:")
+    logger.info(f"    Total provisional segments:      {funnel['total_provisional']:,}")
+    logger.info(f"    Sub-segments created (long ones split): {funnel['subsegments_created']:,}")
+    logger.info(f"    Rejected: too few points:        {funnel['rejected_too_few_points']:,}")
+    logger.info(f"    Rejected: too short duration:    {funnel['rejected_too_short']:,}")
+    logger.info(f"    Rejected: too few unique coords: {funnel['rejected_too_few_unique_coords']:,}")
+    logger.info(f"    Rejected: low uniqueness ratio:  {funnel['rejected_low_uniqueness']:,}")
+    logger.info(f"    Rejected: too displaced:         {funnel['rejected_too_displaced']:,}")
+    logger.info(f"    Passed all filters:              {funnel['passed_all_filters']:,}")
+
     if len(seg_summary) == 0:
         logger.warning("  No valid segments found! Check thresholds.")
-        return seg_summary
+        return seg_summary, funnel
 
     logger.info(f"  sigma_pos: median={seg_summary['sigma_pos_m'].median():.2f}m, "
                 f"mean={seg_summary['sigma_pos_m'].mean():.2f}m, "
                 f"p95={seg_summary['sigma_pos_m'].quantile(0.95):.2f}m")
-    return seg_summary
+    logger.info(f"  uniqueness: median={seg_summary['uniqueness_ratio'].median():.3f}, "
+                f"min={seg_summary['uniqueness_ratio'].min():.3f}")
+    return seg_summary, funnel
 
 
 # ============================================================
@@ -408,9 +489,57 @@ def compute_data_quality(df: pd.DataFrame, seg_summary: pd.DataFrame, logger) ->
 
 def make_figures(seg_summary: pd.DataFrame, grid_dfs: dict,
                  temporal_df: pd.DataFrame, fig_dir: Path, city: str,
-                 logger):
+                 logger, funnel: dict = None):
     """Generate diagnostic figures saved as PNG."""
     fig_dir.mkdir(parents=True, exist_ok=True)
+
+    # Always plot filter funnel if available, even if no segments survived
+    if funnel is not None:
+        try:
+            fig, ax = plt.subplots(figsize=(10, 5))
+            stages = [
+                ("Provisional", funnel["total_provisional"]),
+                ("Sub-segments\n(after split)",
+                    funnel["total_provisional"] + funnel["subsegments_created"]
+                    - sum(1 for _ in [funnel["total_provisional"]] if _)),  # informational
+                ("Pass: enough pts",
+                    funnel["total_provisional"] + funnel["subsegments_created"]
+                    - funnel["rejected_too_few_points"]),
+                ("Pass: long enough",
+                    funnel["total_provisional"] + funnel["subsegments_created"]
+                    - funnel["rejected_too_few_points"]
+                    - funnel["rejected_too_short"]),
+                ("Pass: enough\nunique coords",
+                    funnel["total_provisional"] + funnel["subsegments_created"]
+                    - funnel["rejected_too_few_points"]
+                    - funnel["rejected_too_short"]
+                    - funnel["rejected_too_few_unique_coords"]),
+                ("Pass: high\nuniqueness",
+                    funnel["total_provisional"] + funnel["subsegments_created"]
+                    - funnel["rejected_too_few_points"]
+                    - funnel["rejected_too_short"]
+                    - funnel["rejected_too_few_unique_coords"]
+                    - funnel["rejected_low_uniqueness"]),
+                ("FINAL: passed\ndisplacement",
+                    funnel["passed_all_filters"]),
+            ]
+            labels = [s[0] for s in stages]
+            counts = [s[1] for s in stages]
+            colors = ["#4393C3"] * (len(stages) - 1) + ["#2166AC"]
+            bars = ax.bar(labels, counts, color=colors, edgecolor="white")
+            for bar, c in zip(bars, counts):
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(),
+                        f"{c:,}", ha="center", va="bottom", fontsize=9)
+            ax.set_ylabel("Number of segments")
+            ax.set_title(f"({city}) Filter funnel: provisional → valid")
+            ax.tick_params(axis="x", rotation=0, labelsize=8)
+            ax.grid(alpha=0.3, axis="y")
+            plt.tight_layout()
+            plt.savefig(fig_dir / "fig6_filter_funnel.png", dpi=150)
+            plt.close()
+        except Exception as e:
+            logger.warning(f"Could not draw funnel: {e}")
+
     if len(seg_summary) == 0:
         logger.warning("No segments to plot.")
         return
@@ -567,12 +696,15 @@ def run_poc(city: str, data_root: Path, out_root: Path):
     # Step 2: Detect stationary segments
     seg_df = detect_stationary_segments(df, logger)
 
-    # Step 3: Compute sigma_pos per segment
-    seg_summary = compute_segment_sigma_pos(seg_df, logger)
+    # Step 3: Compute sigma_pos per segment (returns funnel stats too)
+    seg_summary, funnel = compute_segment_sigma_pos(seg_df, logger)
+
+    # Save filter funnel even if no segments survived (helpful for debugging)
+    with open(out_dir / "stats" / "filter_funnel.json", "w") as f:
+        json.dump(funnel, f, indent=2)
 
     if len(seg_summary) == 0:
         logger.error("No valid segments found - check thresholds or data quality")
-        # Still save data quality report
         quality = compute_data_quality(df, seg_summary, logger)
         with open(out_dir / "stats" / "data_quality.json", "w") as f:
             json.dump(quality, f, indent=2, default=str)
@@ -613,7 +745,7 @@ def run_poc(city: str, data_root: Path, out_root: Path):
 
     # Step 8: Figures
     make_figures(seg_summary, grid_dfs, temporal_df,
-                 out_dir / "figures", city, logger)
+                 out_dir / "figures", city, logger, funnel=funnel)
 
     # Step 9: Final summary printout
     logger.info("\n" + "="*60)

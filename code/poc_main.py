@@ -21,6 +21,7 @@ Author: [Your Team]
 """
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -32,6 +33,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+# Try to import psutil for memory monitoring; not required
+try:
+    import psutil
+    _HAS_PSUTIL = True
+except ImportError:
+    _HAS_PSUTIL = False
 
 # Plotting (saved to file, no display needed)
 import matplotlib
@@ -103,47 +111,116 @@ def setup_logger(out_dir: Path):
 # DATA LOADING
 # ============================================================
 
-def load_city_data(city_dir: Path, logger) -> pd.DataFrame:
-    """Read all parquet files in a city directory, concat them.
+def _mem_mb():
+    """Return current process memory in MB, or None if psutil not available."""
+    if not _HAS_PSUTIL:
+        return None
+    try:
+        return psutil.Process().memory_info().rss / (1024 ** 2)
+    except Exception:
+        return None
 
-    Expected schema (based on the sample data):
-        vehicle_id, lon, lat, speed_kmh, heading, status, gps_time,
-        recv_time, veh_type, admin_code, road_name, road_class
+
+def find_parquet_files(city_dir: Path):
+    """Find parquet files in a city directory.
+
+    Searches both the directory itself and any subdirectories (rglob).
+    This is robust to whether HKUST organizes data as
+        city_data/beijing/*.parquet (flat, multiple files)
+    or
+        city_data/beijing/2019-10-14/*.parquet (per-day subfolders)
     """
-    parquet_files = sorted(city_dir.glob("*.parquet"))
-    if not parquet_files:
-        raise FileNotFoundError(f"No parquet files found in {city_dir}")
+    files = sorted(set(city_dir.rglob("*.parquet")))
+    return files
 
-    logger.info(f"Found {len(parquet_files)} parquet files in {city_dir}")
-    dfs = []
-    for f in parquet_files:
-        df = pd.read_parquet(f)
-        dfs.append(df)
-        logger.info(f"  Loaded {f.name}: {len(df):,} rows")
 
-    df = pd.concat(dfs, ignore_index=True)
+def load_one_file(path: Path) -> pd.DataFrame:
+    """Read and clean a single parquet file (without sorting).
 
-    # Parse types
+    Sorting happens later, per-vehicle, in the streaming pipeline.
+    """
+    df = pd.read_parquet(path)
+
+    # Type coercion
     df["gps_time"] = pd.to_datetime(df["gps_time"], errors="coerce")
     df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
     df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
     df["speed_kmh"] = pd.to_numeric(df["speed_kmh"], errors="coerce")
 
     # Drop bad rows
-    n0 = len(df)
     df = df.dropna(subset=["vehicle_id", "lon", "lat", "speed_kmh", "gps_time"])
-    df = df[(df["lon"] > 70) & (df["lon"] < 140) & (df["lat"] > 15) & (df["lat"] < 55)]
-    df = df[df["speed_kmh"] >= 0]
-    df = df[df["speed_kmh"] < 200]  # exceeding 200 km/h is taxi GPS error
+    df = df[(df["lon"] > 70) & (df["lon"] < 140) &
+            (df["lat"] > 15) & (df["lat"] < 55)]
+    df = df[(df["speed_kmh"] >= 0) & (df["speed_kmh"] < 200)]
+    return df
 
-    # Sort once: this is required for segmentation
+
+def load_city_data(city_dir: Path, logger) -> pd.DataFrame:
+    """Read all parquet files in a city directory recursively, concat them.
+
+    For LARGE multi-day data (e.g. 7 days = 100M+ records), prefer using
+    `iter_vehicle_chunks` instead of this function — it processes data
+    in vehicle-id chunks to keep memory bounded.
+
+    Expected schema (based on the sample data):
+        vehicle_id, lon, lat, speed_kmh, heading, status, gps_time, ...
+    """
+    files = find_parquet_files(city_dir)
+    if not files:
+        raise FileNotFoundError(f"No parquet files found in {city_dir} (recursive)")
+    logger.info(f"Found {len(files)} parquet files in {city_dir} (recursive)")
+
+    dfs = []
+    n_total_pre = 0
+    for i, f in enumerate(files):
+        df = load_one_file(f)
+        n_total_pre += len(df)
+        dfs.append(df)
+        mem = _mem_mb()
+        mem_str = f", mem={mem:.0f}MB" if mem else ""
+        logger.info(f"  [{i+1}/{len(files)}] {f.name}: {len(df):,} valid rows"
+                    f"{mem_str}")
+
+    df = pd.concat(dfs, ignore_index=True)
+    del dfs
+    gc.collect()
+
     df = df.sort_values(["vehicle_id", "gps_time"]).reset_index(drop=True)
-    logger.info(f"Total records after cleaning: {len(df):,} (dropped {n0-len(df):,})")
+    logger.info(f"Total records after cleaning & concat: {len(df):,}")
     logger.info(f"Unique vehicles: {df['vehicle_id'].nunique():,}")
     logger.info(f"Time range: {df['gps_time'].min()} -> {df['gps_time'].max()}")
     logger.info(f"Spatial extent: lon [{df['lon'].min():.4f}, {df['lon'].max():.4f}], "
                 f"lat [{df['lat'].min():.4f}, {df['lat'].max():.4f}]")
     return df
+
+
+def estimate_dataset_size(city_dir: Path, logger) -> dict:
+    """Quickly estimate dataset size to decide if we need streaming mode.
+
+    Reads first parquet file to get average row size, then extrapolates
+    from total file size on disk.
+    """
+    files = find_parquet_files(city_dir)
+    if not files:
+        return {"n_files": 0, "total_disk_mb": 0, "estimated_rows": 0}
+
+    total_disk = sum(f.stat().st_size for f in files)
+    # Sample first file to estimate rows-per-MB (compressed parquet is roughly 5-10x denser than memory)
+    sample = pd.read_parquet(files[0])
+    rows_per_disk_byte = len(sample) / files[0].stat().st_size
+    estimated_rows = int(total_disk * rows_per_disk_byte)
+
+    info = {
+        "n_files": len(files),
+        "total_disk_mb": total_disk / (1024**2),
+        "estimated_rows": estimated_rows,
+        "estimated_mem_gb_full_load": estimated_rows * 200 / (1024**3),  # ~200B/row in pandas
+    }
+    logger.info(f"Dataset size estimate: {info['n_files']} files, "
+                f"{info['total_disk_mb']:.0f} MB on disk, "
+                f"~{info['estimated_rows']:,} rows, "
+                f"~{info['estimated_mem_gb_full_load']:.1f} GB mem if full-loaded")
+    return info
 
 
 # ============================================================
@@ -667,14 +744,21 @@ def make_figures(seg_summary: pd.DataFrame, grid_dfs: dict,
 # MAIN
 # ============================================================
 
-def run_poc(city: str, data_root: Path, out_root: Path):
-    """Run full PoC pipeline for one city."""
+def run_poc(city: str, data_root: Path, out_root: Path,
+            streaming_threshold_gb: float = 6.0):
+    """Run full PoC pipeline for one city.
+
+    Memory strategy:
+    - If estimated dataset size <= streaming_threshold_gb (default 6 GB),
+      use the simple "load all + process" mode (faster, simpler).
+    - If larger, switch to streaming mode: load files, partition by
+      vehicle_id, then process vehicles in batches of ~5000 at a time.
+      Memory peak is bounded by the largest single file plus
+      one batch of vehicles.
+    """
     city_dir = data_root / city
     out_dir = out_root / f"poc_{city}"
 
-    # Auto-cleanup: remove old output for this city to ensure fresh results.
-    # Only this city's poc_<city> folder is removed; other cities and the
-    # diag_<city> folders are untouched.
     if out_dir.exists():
         print(f"[INFO] Removing existing {out_dir}")
         shutil.rmtree(out_dir)
@@ -689,37 +773,54 @@ def run_poc(city: str, data_root: Path, out_root: Path):
     logger.info(f"Data dir: {city_dir}")
     logger.info(f"Output dir: {out_dir}")
     logger.info(f"Run started at {datetime.now().isoformat()}")
+    if _HAS_PSUTIL:
+        logger.info(f"Memory monitoring: enabled (psutil available)")
+    else:
+        logger.info(f"Memory monitoring: disabled (install psutil for memory tracking)")
 
-    # Step 1: Load data
-    df = load_city_data(city_dir, logger)
+    # Estimate dataset size to choose pipeline mode
+    size_info = estimate_dataset_size(city_dir, logger)
+    use_streaming = size_info["estimated_mem_gb_full_load"] > streaming_threshold_gb
+    if use_streaming:
+        logger.info(f"  -> STREAMING mode (data > {streaming_threshold_gb} GB threshold)")
+    else:
+        logger.info(f"  -> SIMPLE mode (data <= {streaming_threshold_gb} GB threshold)")
 
-    # Step 2: Detect stationary segments
-    seg_df = detect_stationary_segments(df, logger)
+    # Save dataset size info immediately (useful even if pipeline crashes later)
+    with open(out_dir / "stats" / "dataset_size.json", "w") as f:
+        json.dump({**size_info, "mode": "streaming" if use_streaming else "simple"},
+                   f, indent=2)
 
-    # Step 3: Compute sigma_pos per segment (returns funnel stats too)
-    seg_summary, funnel = compute_segment_sigma_pos(seg_df, logger)
+    if use_streaming:
+        seg_summary, funnel, df_summary = run_streaming_pipeline(city_dir, logger)
+    else:
+        df = load_city_data(city_dir, logger)
+        seg_df = detect_stationary_segments(df, logger)
+        seg_summary, funnel = compute_segment_sigma_pos(seg_df, logger)
+        df_summary = compute_data_quality(df, seg_summary, logger)
+        del df, seg_df
+        gc.collect()
 
-    # Save filter funnel even if no segments survived (helpful for debugging)
+    # Save filter funnel
     with open(out_dir / "stats" / "filter_funnel.json", "w") as f:
         json.dump(funnel, f, indent=2)
 
     if len(seg_summary) == 0:
         logger.error("No valid segments found - check thresholds or data quality")
-        quality = compute_data_quality(df, seg_summary, logger)
         with open(out_dir / "stats" / "data_quality.json", "w") as f:
-            json.dump(quality, f, indent=2, default=str)
+            json.dump(df_summary, f, indent=2, default=str)
         return
 
-    # Step 4: Save segment-level data (intermediate, anonymized - vehicle_id hashed)
+    # Save segment-level data (anonymized)
     seg_summary_anon = seg_summary.copy()
     seg_summary_anon["vehicle_id"] = seg_summary_anon["vehicle_id"].apply(
-        lambda v: f"v{hash(str(v)) % 10**8:08d}"  # 8-digit hash, no reverse possible
+        lambda v: f"v{hash(str(v)) % 10**8:08d}"
     )
     seg_summary_anon.to_parquet(out_dir / "intermediate" / "segments.parquet",
                                  index=False)
     logger.info(f"  Saved {len(seg_summary_anon):,} segments to intermediate/")
 
-    # Step 5: Spatial aggregation at multiple grid sizes
+    # Spatial aggregation
     grid_dfs = {}
     for gs in GRID_SIZES_M:
         agg = aggregate_to_grid(seg_summary, gs, logger)
@@ -727,38 +828,175 @@ def run_poc(city: str, data_root: Path, out_root: Path):
                        index=False)
         grid_dfs[gs] = agg
 
-    # Step 6: Temporal aggregation
+    # Temporal aggregation
     temporal_df = aggregate_temporal(seg_summary, logger)
     temporal_df.to_csv(out_dir / "stats" / "temporal_pattern.csv", index=False)
 
-    # Step 7: Data quality and summary statistics
-    quality = compute_data_quality(df, seg_summary, logger)
+    # Save data quality summary
     with open(out_dir / "stats" / "data_quality.json", "w") as f:
-        json.dump(quality, f, indent=2, default=str)
+        json.dump(df_summary, f, indent=2, default=str)
 
-    # Sigma_pos quantile summary
+    # Sigma quantiles
     quantiles = [0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95, 0.99]
     sigma_quantiles = {f"q{int(q*100):02d}": float(seg_summary["sigma_pos_m"].quantile(q))
                        for q in quantiles}
     with open(out_dir / "stats" / "sigma_pos_quantiles.json", "w") as f:
         json.dump(sigma_quantiles, f, indent=2)
 
-    # Step 8: Figures
+    # Figures
     make_figures(seg_summary, grid_dfs, temporal_df,
                  out_dir / "figures", city, logger, funnel=funnel)
 
-    # Step 9: Final summary printout
+    # Final summary printout
     logger.info("\n" + "="*60)
     logger.info(f"FINAL SUMMARY for {city}:")
-    logger.info(f"  Records:  {quality['n_total_records']:,}")
-    logger.info(f"  Vehicles: {quality['n_unique_vehicles']:,}")
-    logger.info(f"  Stationary segments (valid): {quality['n_valid_segments']:,}")
-    if quality['n_valid_segments'] > 0:
-        logger.info(f"  sigma_pos median:  {quality['sigma_pos_median_m']:.2f}m")
-        logger.info(f"  sigma_pos p95:     {quality['sigma_pos_p95_m']:.2f}m")
-        logger.info(f"  Reasonable range:  {quality['frac_segments_in_reasonable_range']*100:.1f}%")
+    logger.info(f"  Records:  {df_summary['n_total_records']:,}")
+    logger.info(f"  Vehicles: {df_summary['n_unique_vehicles']:,}")
+    logger.info(f"  Stationary segments (valid): {df_summary['n_valid_segments']:,}")
+    if df_summary['n_valid_segments'] > 0:
+        logger.info(f"  sigma_pos median:  {df_summary['sigma_pos_median_m']:.2f}m")
+        logger.info(f"  sigma_pos p95:     {df_summary['sigma_pos_p95_m']:.2f}m")
+        logger.info(f"  Reasonable range:  {df_summary['frac_segments_in_reasonable_range']*100:.1f}%")
     logger.info(f"  Output:   {out_dir}")
     logger.info("="*60)
+
+
+def run_streaming_pipeline(city_dir: Path, logger,
+                            vehicles_per_batch: int = 5000) -> tuple:
+    """Memory-bounded pipeline for large multi-day datasets.
+
+    Strategy:
+      1. Load all parquet files (this still requires ~1× full data in mem briefly)
+      2. Get unique vehicle_ids
+      3. Process vehicles in batches of ~5000 at a time:
+         - Filter df to current batch's vehicles
+         - Detect segments + compute sigma for those vehicles
+         - Append to running results
+         - Drop the batch slice to free memory
+
+    Returns: (seg_summary, funnel, summary_dict)
+    """
+    logger.info("=== Starting streaming pipeline ===")
+
+    # Load all data (this is the main memory peak; we keep df slim)
+    files = find_parquet_files(city_dir)
+    logger.info(f"Loading {len(files)} parquet files...")
+    dfs = []
+    for i, f in enumerate(files):
+        df_chunk = load_one_file(f)
+        # Keep only essential columns to save memory
+        keep_cols = [c for c in ["vehicle_id", "lon", "lat", "speed_kmh", "gps_time"]
+                     if c in df_chunk.columns]
+        df_chunk = df_chunk[keep_cols]
+        dfs.append(df_chunk)
+        mem = _mem_mb()
+        mem_str = f", mem={mem:.0f}MB" if mem else ""
+        logger.info(f"  [{i+1}/{len(files)}] loaded {f.name}: "
+                    f"{len(df_chunk):,} rows{mem_str}")
+
+    df = pd.concat(dfs, ignore_index=True)
+    del dfs
+    gc.collect()
+
+    n_total = len(df)
+    n_vehicles = df.vehicle_id.nunique()
+    time_min = df.gps_time.min()
+    time_max = df.gps_time.max()
+    logger.info(f"Total: {n_total:,} records, {n_vehicles:,} vehicles, "
+                f"time {time_min} to {time_max}")
+    mem = _mem_mb()
+    if mem:
+        logger.info(f"Memory after concat: {mem:.0f}MB")
+
+    # Sort by vehicle and time so vehicle batches are contiguous
+    logger.info("Sorting by vehicle_id, gps_time (this can take a few minutes)...")
+    df = df.sort_values(["vehicle_id", "gps_time"]).reset_index(drop=True)
+    gc.collect()
+
+    # Get all unique vehicles
+    all_vehicles = df.vehicle_id.unique()
+    logger.info(f"Processing {len(all_vehicles):,} vehicles in batches of {vehicles_per_batch}")
+
+    # Process in batches
+    all_seg_summaries = []
+    combined_funnel = {
+        "total_provisional": 0, "subsegments_created": 0,
+        "rejected_too_few_points": 0, "rejected_too_short": 0,
+        "rejected_too_displaced": 0, "rejected_low_uniqueness": 0,
+        "rejected_too_few_unique_coords": 0, "passed_all_filters": 0,
+    }
+
+    n_batches = (len(all_vehicles) + vehicles_per_batch - 1) // vehicles_per_batch
+    for bi in range(n_batches):
+        start = bi * vehicles_per_batch
+        end = min((bi + 1) * vehicles_per_batch, len(all_vehicles))
+        batch_vehicles = all_vehicles[start:end]
+        sub_df = df[df.vehicle_id.isin(set(batch_vehicles))].copy()
+
+        if len(sub_df) == 0:
+            continue
+
+        # Run segment detection + sigma computation on this batch only
+        seg_df_batch = detect_stationary_segments(sub_df, logger)
+        seg_summary_batch, funnel_batch = compute_segment_sigma_pos(seg_df_batch, logger)
+
+        # Accumulate
+        if len(seg_summary_batch) > 0:
+            all_seg_summaries.append(seg_summary_batch)
+        for k in combined_funnel:
+            combined_funnel[k] += funnel_batch.get(k, 0)
+
+        del sub_df, seg_df_batch, seg_summary_batch
+        gc.collect()
+        mem = _mem_mb()
+        mem_str = f", mem={mem:.0f}MB" if mem else ""
+        n_so_far = sum(len(s) for s in all_seg_summaries)
+        logger.info(f"  Batch [{bi+1}/{n_batches}]: vehicles {start}-{end}, "
+                    f"{n_so_far:,} valid segments accumulated{mem_str}")
+
+    # Combine batch results
+    if all_seg_summaries:
+        seg_summary = pd.concat(all_seg_summaries, ignore_index=True)
+    else:
+        seg_summary = pd.DataFrame()
+
+    # Build summary dict (don't compute distances etc on raw df beyond basics)
+    summary = {
+        "n_total_records": int(n_total),
+        "n_unique_vehicles": int(n_vehicles),
+        "time_span_h": float((time_max - time_min).total_seconds() / 3600),
+        "lon_min": float(df.lon.min()),
+        "lon_max": float(df.lon.max()),
+        "lat_min": float(df.lat.min()),
+        "lat_max": float(df.lat.max()),
+        "n_valid_segments": int(len(seg_summary)),
+    }
+    # Sampling intervals from a sample to avoid full-df pass
+    sample_size = min(2_000_000, len(df))
+    df_sample = df.sample(sample_size, random_state=42).sort_values(
+        ["vehicle_id", "gps_time"])
+    dt = df_sample.groupby("vehicle_id")["gps_time"].diff().dt.total_seconds().dropna()
+    if len(dt) > 0:
+        summary["sampling_interval_p25_s"] = float(dt.quantile(0.25))
+        summary["sampling_interval_p50_s"] = float(dt.quantile(0.50))
+        summary["sampling_interval_p75_s"] = float(dt.quantile(0.75))
+    summary["frac_records_speed_zero"] = float((df["speed_kmh"] == 0).mean())
+    summary["frac_records_speed_lt5"] = float((df["speed_kmh"] < 5).mean())
+
+    if len(seg_summary) > 0:
+        summary["sigma_pos_median_m"] = float(seg_summary.sigma_pos_m.median())
+        summary["sigma_pos_mean_m"] = float(seg_summary.sigma_pos_m.mean())
+        summary["sigma_pos_p95_m"] = float(seg_summary.sigma_pos_m.quantile(0.95))
+        summary["sigma_pos_min_m"] = float(seg_summary.sigma_pos_m.min())
+        summary["sigma_pos_max_m"] = float(seg_summary.sigma_pos_m.max())
+        summary["frac_segments_in_reasonable_range"] = float(
+            ((seg_summary.sigma_pos_m >= SIGMA_POS_REASONABLE_RANGE_M[0]) &
+             (seg_summary.sigma_pos_m <= SIGMA_POS_REASONABLE_RANGE_M[1])).mean()
+        )
+
+    del df
+    gc.collect()
+    return seg_summary, combined_funnel, summary
 
 
 def main():
@@ -772,6 +1010,9 @@ def main():
                         help="Root dir containing city subdirs")
     parser.add_argument("--out-root", default="../output",
                         help="Root dir for output")
+    parser.add_argument("--streaming-threshold-gb", type=float, default=6.0,
+                        help="Estimated dataset size (GB) above which to use "
+                             "streaming mode (default 6.0)")
     args = parser.parse_args()
 
     data_root = Path(args.data_root).resolve()
@@ -784,9 +1025,10 @@ def main():
         cities = [args.city]
     else:
         # Auto-discover: every subfolder of data_root that contains parquet files
+        # (recursive, so per-day subfolders within a city also count)
         cities = []
         for sub in sorted(data_root.iterdir()):
-            if sub.is_dir() and any(sub.glob("*.parquet")):
+            if sub.is_dir() and any(sub.rglob("*.parquet")):
                 cities.append(sub.name)
         if not cities:
             sys.exit(f"No city subfolders with parquet files found in {data_root}")
@@ -799,7 +1041,8 @@ def main():
             print(f"# [{i+1}/{len(cities)}] Processing city: {city}")
             print(f"{'#'*70}")
         try:
-            run_poc(city, data_root, out_root)
+            run_poc(city, data_root, out_root,
+                     streaming_threshold_gb=args.streaming_threshold_gb)
         except Exception as e:
             failed.append(city)
             print(f"[BATCH] {city} failed with: {e}")
